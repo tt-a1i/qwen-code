@@ -9,7 +9,8 @@ import {
   MCP_RESTART_CLIENT_HEADROOM_MS,
 } from '@qwen-code/acp-bridge/mcpTimeouts';
 import { DaemonAuthFlow } from './DaemonAuthFlow.js';
-import { parseSseStream } from './sse.js';
+import type { DaemonTransport } from './DaemonTransport.js';
+import { RestSseTransport } from './RestSseTransport.js';
 import type {
   DaemonAgentMutationResult,
   DaemonAuthProviderId,
@@ -121,6 +122,13 @@ export interface DaemonClientOptions {
    * Defaults to 30s. Set to `0` or `Infinity` to disable.
    */
   fetchTimeoutMs?: number;
+  /**
+   * Pluggable transport. When omitted, a `RestSseTransport` is created
+   * automatically — this preserves the existing REST+SSE behavior with
+   * zero caller-side changes. Pass an `AcpWsTransport` or
+   * `AcpHttpTransport` to use JSON-RPC over WebSocket or HTTP.
+   */
+  transport?: DaemonTransport;
 }
 
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
@@ -302,6 +310,12 @@ export class DaemonClient {
   private readonly token: string | undefined;
   private readonly _fetch: typeof globalThis.fetch;
   private readonly fetchTimeoutMs: number;
+  /**
+   * Pluggable transport layer. Defaults to `RestSseTransport` when
+   * no explicit transport is supplied — preserving the pre-abstraction
+   * REST+SSE behavior with zero breaking changes.
+   */
+  readonly transport: DaemonTransport;
   // Lazy singleton so clients that never touch auth pay no allocation cost.
   // Exposed via the readonly `auth` accessor below.
   private _authFlow?: DaemonAuthFlow;
@@ -337,6 +351,9 @@ export class DaemonClient {
     // it instead of defending the math at every call site.
     const raw = opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
     this.fetchTimeoutMs = Number.isFinite(raw) && raw > 0 ? raw : 0;
+    this.transport =
+      opts.transport ??
+      new RestSseTransport(this.baseUrl, this.token, this._fetch);
   }
 
   /**
@@ -384,7 +401,7 @@ export class DaemonClient {
       effectiveTimeoutMs = perCallTimeoutMs;
     }
     if (!effectiveTimeoutMs || !Number.isFinite(effectiveTimeoutMs)) {
-      const res = await this._fetch(url, init);
+      const res = await this.transport.fetch(url, init);
       if (consume) return consume(res);
       return res as unknown as T;
     }
@@ -409,7 +426,7 @@ export class DaemonClient {
       ? composeAbortSignals([callerSignal, ctrl.signal])
       : ctrl.signal;
     try {
-      const res = await this._fetch(url, { ...init, signal });
+      const res = await this.transport.fetch(url, { ...init, signal });
       if (consume) return await consume(res);
       return res as unknown as T;
     } finally {
@@ -1336,7 +1353,7 @@ export class DaemonClient {
     sessionId: string,
     opts?: { signal?: AbortSignal; clientId?: string },
   ): Promise<DaemonSessionRecapResult> {
-    const res = await this._fetch(
+    const res = await this.transport.fetch(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/recap`,
       {
         method: 'POST',
@@ -1357,7 +1374,7 @@ export class DaemonClient {
     question: string,
     opts?: { signal?: AbortSignal; clientId?: string },
   ): Promise<DaemonSessionBtwResult> {
-    const res = await this._fetch(
+    const res = await this.transport.fetch(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/btw`,
       {
         method: 'POST',
@@ -1385,7 +1402,7 @@ export class DaemonClient {
     command: string,
     opts?: { signal?: AbortSignal; clientId?: string },
   ): Promise<DaemonShellCommandResult> {
-    const res = await this._fetch(
+    const res = await this.transport.fetch(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/shell`,
       {
         method: 'POST',
@@ -1759,7 +1776,7 @@ export class DaemonClient {
     signal?: AbortSignal,
     clientId?: string,
   ): Promise<PromptResult> {
-    const res = await this._fetch(
+    const res = await this.transport.fetch(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/prompt`,
       {
         method: 'POST',
@@ -1804,7 +1821,7 @@ export class DaemonClient {
     signal?: AbortSignal,
     clientId?: string,
   ): Promise<NonBlockingPromptAccepted | PromptResult> {
-    const res = await this._fetch(
+    const res = await this.transport.fetch(
       `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/prompt`,
       {
         method: 'POST',
@@ -1916,87 +1933,16 @@ export class DaemonClient {
     sessionId: string,
     opts: SubscribeOptions = {},
   ): AsyncGenerator<DaemonEvent> {
-    const headers = this.headers({ Accept: 'text/event-stream' });
-    if (opts.lastEventId !== undefined) {
-      headers['Last-Event-ID'] = String(opts.lastEventId);
-    }
-    // Apply `fetchTimeoutMs` to the CONNECT phase only (request → headers
-    // received). The SSE body itself must NOT be timed out — it's
-    // long-lived by design — so once `_fetch` returns the timer is
-    // cleared. Without this, an unresponsive daemon (TCP open but no
-    // headers) blocks `subscribeEvents` indefinitely instead of
-    // failing with the same 30s default the rest of the SDK uses.
-    const connectCtrl = new AbortController();
-    let connectTimer: ReturnType<typeof setTimeout> | undefined;
-    if (this.fetchTimeoutMs && Number.isFinite(this.fetchTimeoutMs)) {
-      connectTimer = setTimeout(
-        () =>
-          connectCtrl.abort(
-            new DOMException('Initial connect timed out', 'TimeoutError'),
-          ),
-        this.fetchTimeoutMs,
-      );
-      if (
-        typeof connectTimer === 'object' &&
-        connectTimer &&
-        'unref' in connectTimer
-      ) {
-        (connectTimer as { unref: () => void }).unref();
-      }
-    }
-    const fetchSignal = opts.signal
-      ? composeAbortSignals([opts.signal, connectCtrl.signal])
-      : connectCtrl.signal;
-    // Build the SSE URL, optionally with `?maxQueued=N`. We don't
-    // validate the value client-side — the daemon's
-    // `parseMaxQueuedQuery` is the source of truth on the range
-    // `[16, 2048]` and returns a structured `400 invalid_max_queued`
-    // for anything outside, so duplicating the bounds here would
-    // diverge if the daemon's range ever shifts.
-    let url = `${this.baseUrl}/session/${encodeURIComponent(sessionId)}/events`;
-    if (opts.maxQueued !== undefined) {
-      url += `?maxQueued=${encodeURIComponent(String(opts.maxQueued))}`;
-    }
-    let res: Response;
-    try {
-      res = await this._fetch(url, { headers, signal: fetchSignal });
-    } finally {
-      if (connectTimer !== undefined) clearTimeout(connectTimer);
-    }
-    if (!res.ok) {
-      throw await this.failOnError(res, 'GET /session/:id/events');
-    }
-    // A 200 with the wrong content type usually means a misconfigured
-    // proxy or middleware swallowed our SSE response and replaced it
-    // with JSON/HTML. Without this check `parseSseStream` would
-    // silently produce zero frames — a confusing "no events" symptom
-    // that's easy to misdiagnose. Fail fast with the actual mime type.
-    //
-    // Cancel the body before throwing so undici doesn't keep the
-    // underlying socket pinned waiting for the consumer. Same
-    // reasoning as `respondToPermission` — long-running clients
-    // hitting this path repeatedly would otherwise exhaust the
-    // connection pool.
-    const ct = res.headers.get('content-type') ?? '';
-    if (!ct.toLowerCase().includes('text/event-stream')) {
-      try {
-        await res.body?.cancel();
-      } catch {
-        /* body already consumed or no body */
-      }
-      throw new DaemonHttpError(
-        res.status,
-        ct,
-        `GET /session/:id/events: expected content-type text/event-stream, got "${ct}"`,
-      );
-    }
-    if (!res.body) {
-      throw new Error('SSE response has no body');
-    }
-    // Forward the abort signal so post-200 aborts stop the iteration.
-    // Without this, callers who `controller.abort()` after the response
-    // arrives keep receiving frames until the upstream closes.
-    yield* parseSseStream(res.body, opts.signal);
+    // Delegate entirely to the transport. The transport handles
+    // connect-phase timeout, Last-Event-ID, maxQueued, content-type
+    // validation, and SSE parsing (for REST) or JSON-RPC notification
+    // filtering (for ACP transports).
+    yield* this.transport.subscribeEvents(sessionId, {
+      lastEventId: opts.lastEventId,
+      maxQueued: opts.maxQueued,
+      signal: opts.signal,
+      connectTimeoutMs: this.fetchTimeoutMs || undefined,
+    });
   }
 
   // -- Permissions -------------------------------------------------------
@@ -2283,6 +2229,17 @@ export class DaemonClient {
         return (await res.json()) as DaemonAuthProviderInstallResult;
       },
     );
+  }
+
+  // -- Lifecycle / disposal ------------------------------------------------
+
+  /**
+   * Release transport resources (WS close, etc.). Idempotent.
+   * After `dispose()`, further calls to `fetch` / `subscribeEvents`
+   * on the underlying transport throw `DaemonTransportClosedError`.
+   */
+  dispose(): void {
+    this.transport.dispose();
   }
 
   // -- Session metadata ----------------------------------------------------
