@@ -176,6 +176,27 @@ describe('useKeypress', () => {
     expect(onKeypress).toHaveBeenCalledWith(expect.objectContaining(key));
   });
 
+  it('should call the latest keypress handler after rerender', () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const { rerender } = renderHook(
+      ({ handler }) => useKeypress(handler, { isActive: true }),
+      {
+        initialProps: { handler: first },
+        wrapper,
+      },
+    );
+
+    rerender({ handler: second });
+    act(() => stdin.pressKey({ name: 'a', sequence: 'a' }));
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'a', sequence: 'a' }),
+    );
+  });
+
   it('should set and release raw mode', () => {
     const { unmount } = renderHook(
       () => useKeypress(onKeypress, { isActive: true }),

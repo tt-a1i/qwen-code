@@ -13,29 +13,6 @@ import stripAnsi from 'strip-ansi';
 
 const wait = (ms = 50) => new Promise((resolve) => setTimeout(resolve, ms));
 const clean = (value: string | undefined) => stripAnsi(value ?? '');
-const waitForFrame = async (
-  predicate: () => void,
-  options: { timeout?: number; interval?: number } = {},
-) => {
-  const { timeout = 1000, interval = 10 } = options;
-  const start = Date.now();
-  let lastError: unknown;
-
-  while (Date.now() - start < timeout) {
-    try {
-      predicate();
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-    await wait(interval);
-  }
-
-  if (lastError) {
-    throw lastError;
-  }
-  throw new Error('waitForFrame timed out');
-};
 
 const createSingleQuestion = (
   overrides: Partial<
@@ -324,36 +301,53 @@ describe('<AskUserQuestionDialog />', () => {
       await wait();
 
       stdin.write('4'); // Select "Other" custom input
-      await waitForFrame(() => {
-        expect(clean(lastFrame())).toContain('❯ 4.');
-      });
+      await vi.waitFor(
+        () => {
+          expect(clean(lastFrame())).toContain('❯ 4.');
+        },
+        { interval: 10 },
+      );
       await wait();
 
       stdin.write('j');
-      await waitForFrame(() => {
-        const frame = clean(lastFrame());
-        expect(frame).toContain('❯ 4.');
-        expect(frame).toContain('j');
-      });
+      await vi.waitFor(
+        () => {
+          const frame = clean(lastFrame());
+          expect(frame).toContain('❯ 4.');
+          expect(frame).toContain('j');
+        },
+        { interval: 10 },
+      );
 
       stdin.write('k');
-      await waitForFrame(() => {
-        const frame = clean(lastFrame());
-        expect(frame).toContain('❯ 4.');
-        expect(frame).toContain('jk');
-      });
+      await vi.waitFor(
+        () => {
+          const frame = clean(lastFrame());
+          expect(frame).toContain('❯ 4.');
+          expect(frame).toContain('jk');
+        },
+        { interval: 10 },
+      );
 
       stdin.write('\u0010'); // Ctrl+P
       await wait();
-      await waitForFrame(() => {
-        expect(clean(lastFrame())).toContain('❯ 3. Green');
-      });
+      await vi.waitFor(
+        () => {
+          expect(clean(lastFrame())).toContain('❯ 3. Green');
+        },
+        { interval: 10 },
+      );
 
       stdin.write('\u000E'); // Ctrl+N
       await wait();
-      await waitForFrame(() => {
-        expect(clean(lastFrame())).toContain('❯ 4.');
-      });
+      await vi.waitFor(
+        () => {
+          const frame = clean(lastFrame());
+          expect(frame).toContain('❯ 4.');
+          expect(frame).toContain('jk');
+        },
+        { interval: 10 },
+      );
 
       unmount();
     });
